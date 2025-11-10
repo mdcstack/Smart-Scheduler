@@ -34,13 +34,13 @@ SYSTEM_PROMPT = """
 You are a 'Smart Study Scheduler' assistant. Your goal is to be a proactive, intelligent planner for the user.
 
 **CORE RULES & DATE HANDLING (CRITICAL):**
-1.  **Look for the Current Date:** On the user's first turn, you will receive a system message stating "Today is [Date]". You MUST use this date as the absolute reference for all calculations.
+1.  **Look for the Current Date:** On the user's first turn, you will receive a system message stating "CRITICAL: Today's date is [Date]". You MUST use this as the absolute, locked-in reference for all date math.
 2.  **Relative Date Logic (Examples):**
-    * If "Today is Tuesday, Nov 4" and the user says "this Friday," you MUST use Nov 7.
-    * If "Today is Tuesday, Nov 4" and the user says "this Saturday," you MUST use Nov 8.
-    * If "Today is Tuesday, Nov 4" and the user says "next week Saturday," you MUST use Nov 15.
-    * If "Today is Tuesday, Nov 4" and the user says "due Saturday," you MUST assume the *nearest future* Saturday, which is Nov 8.
-3.  **Reject Explicit Past Dates:** If a user provides an explicit date that is in the past, you MUST NOT call any tool. Instead, respond directly: "Sorry, I can't add items for dates that have already passed. Please provide a future date."
+    * **"This Week":** If "Today is Tuesday, Nov 4" and the user says "this Friday," you MUST use Nov 7.
+    * **"Next Week":** If "Today is Tuesday, Nov 4" and the user says "next week Friday," you MUST use Nov 14.
+    * **"Next Week" (Saturday):** If "Today is Tuesday, Nov 4" and the user says "next week Saturday," you MUST use Nov 15.
+    * **Ambiguous/Nearest:** If "Today is Tuesday, Nov 4" and the user says "due Saturday," you MUST assume the *nearest future* Saturday, which is Nov 8.
+3.  **Reject Explicit Past Dates:** If a user provides an explicit date that is in the past (e.g., "Add a task due yesterday"), you MUST NOT call any tool. Instead, respond directly: "Sorry, I can't add items for dates that have already passed. Please provide a future date."
 4.  **Year Context:** You will be given the current year. Use it for all date calculations.
 
 **YOUR PRIMARY LOGIC FLOW:**
@@ -65,7 +65,7 @@ You are a 'Smart Study Scheduler' assistant. Your goal is to be a proactive, int
 
 4.  **DATA ENTRY (Your main job):**
     * If the user is not in a planning flow, just add/update data.
-    * Use `save_class`, `save_task`, `save_test`, `update_task_deadline`, etc. as requested.
+    * Use `save_class`, `save_task`, `save_test`, `update_task_details`, etc. as requested.
     * If a new task/test is added, call `run_planner_engine` *after* saving the item to update the plan.
 
 5.  **PLAN GENERATION (The "Engine"):**
@@ -73,7 +73,6 @@ You are a 'Smart Study Scheduler' assistant. Your goal is to be a proactive, int
 """
 # === END OF CHANGE ===
 
-# (All your tools functions from lines 40-225 remain unchanged)
 tools = [
     # (All your existing tools remain here... save_preference, save_class, etc.)
     # --- Existing Tools ---
@@ -141,21 +140,27 @@ tools = [
             },
         },
     },
+    # === START OF TOOL CHANGE: Replaced 'update_task_deadline' ===
     {
         "type": "function",
         "function": {
-            "name": "update_task_deadline",
-            "description": "Updates the deadline of an *existing* task, identified by its name.",
+            "name": "update_task_details",
+            "description": "Updates an existing task. Can change its name, type, or deadline.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task_name": {"type": "string", "description": "The name of the task to find."},
-                    "new_deadline": {"type": "string", "description": "The new deadline in YYYY-MM-DDTHH:MM:SS format."}
+                    "current_name": {"type": "string", "description": "The exact current name of the task."},
+                    "new_name": {"type": "string", "description": "The new name (optional)."},
+                    "new_task_type": {"type": "string", "enum": ["assignment", "project", "seatwork"],
+                                      "description": "The new type (optional)."},
+                    "new_deadline": {"type": "string",
+                                     "description": "The new deadline YYYY-MM-DDTHH:MM:SS (optional)."}
                 },
-                "required": ["task_name", "new_deadline"],
+                "required": ["current_name"],
             },
         },
     },
+    # === END OF TOOL CHANGE ===
     {
         "type": "function",
         "function": {
@@ -370,20 +375,48 @@ def update_user_data(username, data_type, data):
     return f"OK, I've added the new {data_type} to your schedule."
 
 
-# --- This is our "UPDATE TASK" function ---
-def update_task_deadline_db(username, args):
-    task_name = args.get("task_name")
+# === START OF FUNCTION CHANGE: Replaced 'update_task_deadline_db' ===
+def update_task_details_db(username, args):
+    current_name = args.get("current_name")
+    new_name = args.get("new_name")
+    new_type = args.get("new_task_type")
     new_deadline = args.get("new_deadline")
 
+    # 1. Build the update dictionary dynamically
+    updates = {}
+    if new_name:
+        updates["tasks.$.name"] = new_name
+    if new_type:
+        updates["tasks.$.task_type"] = new_type
+    if new_deadline:
+        updates["tasks.$.deadline"] = new_deadline
+
+    if not updates:
+        return "You didn't tell me what to update (name, type, or deadline)!"
+
+    # 2. Perform the main update on the 'tasks' array
     result = users_collection.update_one(
-        {"username": username, "tasks.name": task_name},
-        {"$set": {"tasks.$.deadline": new_deadline}}
+        {"username": username, "tasks.name": current_name},
+        {"$set": updates}
     )
 
-    if result.modified_count > 0:
-        return f"OK, I've updated the deadline for '{task_name}'."
-    else:
-        return f"Sorry, I couldn't find a task named '{task_name}' to update."
+    if result.modified_count == 0:
+        return f"Sorry, I couldn't find a task named '{current_name}' to update."
+
+    # 3. CASCADING RENAME: If the name changed, update the generated_plan too.
+    # We use arrayFilters to find ALL plan items that matched the old name.
+    if new_name:
+        # This complex query updates any plan item where 'task' contains the old name
+        users_collection.update_one(
+            {"username": username},
+            {"$set": {"generated_plan.$[elem].task": f"Work on {new_name}"}},
+            array_filters=[{"elem.task": {"$regex": current_name, "$options": "i"}}]
+        )
+
+    return f"OK, I've updated the details for '{new_name or current_name}'."
+
+
+# === END OF FUNCTION CHANGE ===
 
 
 # --- This is our "UPDATE CLASS" function ---
@@ -447,6 +480,45 @@ def delete_schedule_item_db(username, args):
 
 
 # --- NEW PLANNING FUNCTIONS ---
+
+# === START OF NEW AUTO-CLEANUP FUNCTION ===
+def auto_cleanup_past_items(username):
+    """
+    Finds and removes tasks, tests, and plan items that are in the past.
+    This is an efficient "housekeeping" function.
+    """
+    try:
+        now_iso = datetime.now().isoformat()
+        today_date_str = datetime.now().strftime("%Y-%m-%d")
+
+        # Use a single $pull operation to remove items from three different arrays
+        # where their respective date/deadline is "less than" ($lt) the current time.
+        result = users_collection.update_one(
+            {"username": username},
+            {
+                "$pull": {
+                    "tasks": {"deadline": {"$lt": now_iso}},
+                    "tests": {"date": {"$lt": today_date_str}},
+                    "generated_plan": {"date": {"$lt": today_date_str}}
+                }
+            }
+        )
+
+        modified_count = result.modified_count
+        # We can also check result.raw_result['nModified'] or result.matched_count
+        # For MongoDB, modified_count is the standard.
+
+        if modified_count > 0:
+            print(f"Auto-cleanup ran for {username}, removed old items.")
+        else:
+            print(f"Auto-cleanup ran for {username}, no old items to remove.")
+
+    except Exception as e:
+        print(f"Error during auto-cleanup for {username}: {e}")
+
+
+# === END OF NEW AUTO-CLEANUP FUNCTION ===
+
 
 def save_study_windows_db(username, args):
     windows = args.get("windows", [])
@@ -547,10 +619,10 @@ def chat():
 
     # === START OF RESTRUCTURED MESSAGE LOGIC ===
 
-    # 1. Get today's date (as before)
+    # 1. Get today's date
     today_string = datetime.now().strftime("%A, %B %d, %Y")
 
-    # 2. Get the user's FRESH data (this is the critical fix)
+    # 2. Get the user's FRESH data
     fresh_context_data = {
         "schedule": user_data.get("schedule", []),
         "tasks": user_data.get("tasks", []),
@@ -562,13 +634,13 @@ def chat():
     # 3. Create the "header" that MUST be sent every time.
     messages_header = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "system", "content": f"For all date calculations, please be aware that **Today is {today_string}**."},
+        {"role": "system",
+         "content": f"CRITICAL: Today's date is {today_string}. Use this as the anchor for all date math."},
         {"role": "user",
          "content": f"Here is my current data. Assume all new dates are for the year {selected_year}. Context: {json.dumps(fresh_context_data)}"}
     ]
 
     # 4. Filter the old history to get *only* conversational turns.
-    # We skip the old system/context messages to avoid duplication.
     conversational_history = [
         msg for msg in old_full_history
         if msg.get("role") in ["assistant", "tool"] or
@@ -580,7 +652,6 @@ def chat():
         conversational_history = []
 
     # 6. Build the *new* messages list to be used for this turn.
-    # This is now the *only* "messages" variable we need.
     messages = messages_header + conversational_history
     messages.append({"role": "user", "content": user_message})
 
@@ -588,7 +659,7 @@ def chat():
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-4o-mini",
             messages=messages,  # We send the newly constructed list
             tools=tools,
             tool_choice="auto"
@@ -624,9 +695,11 @@ def chat():
                 elif function_name == "save_test":
                     response_msg_for_user = update_user_data(username, "test", arguments)
                     run_planner = True
-                elif function_name == "update_task_deadline":
-                    response_msg_for_user = update_task_deadline_db(username, arguments)
+                # === START OF CHAT ROUTE CHANGE ===
+                elif function_name == "update_task_details":
+                    response_msg_for_user = update_task_details_db(username, arguments)
                     run_planner = True
+                # === END OF CHAT ROUTE CHANGE ===
                 elif function_name == "update_class_schedule":
                     response_msg_for_user = update_class_schedule_db(username, arguments)
                 elif function_name == "delete_schedule_item":
@@ -685,6 +758,13 @@ def get_schedule():
         return jsonify({"error": "Not logged in"}), 401
 
     username = session["username"]
+
+    # === START OF ADDED CODE: TRIGGER AUTO-CLEANUP ===
+    # Run the cleanup function *before* fetching the data.
+    # This ensures the data we send to the frontend is already clean.
+    auto_cleanup_past_items(username)
+    # === END OF ADDED CODE ===
+
     user_data = users_collection.find_one({"username": username})
 
     if not user_data:
@@ -703,3 +783,4 @@ def get_schedule():
 
 if __name__ == "__main__":
     app.run(debug=True)
+
