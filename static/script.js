@@ -65,6 +65,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
   triggerDailyCheckin(); // Run the check on page load.
 
+  // === START OF NEW CODE ===
+  // Add 'Enter' key listener to the chat input
+  const userInput = document.getElementById('user-input');
+  if (userInput) {
+    userInput.addEventListener('keydown', (event) => {
+      // Check if the key pressed was 'Enter' and no modifiers (like Shift)
+      if (event.key === 'Enter' && !event.shiftKey) {
+        // Prevent the default action (like adding a new line)
+        event.preventDefault();
+        // Call the existing sendMessage function
+        sendMessage();
+      }
+    });
+  }
+  // === END OF NEW CODE ===
+
   // === START OF CHANGE: MODAL LOGIC ===
   const modal = document.getElementById('personalizationModal');
   const settingsButton = document.getElementById('settings-button');
